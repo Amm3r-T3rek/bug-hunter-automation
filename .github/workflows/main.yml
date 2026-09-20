@@ -1,0 +1,58 @@
+name: Daily Bug Hunter Scan
+
+on:
+  schedule:
+    # كل يوم الساعة 12 بالليل بتوقيت UTC (2 الفجر بتوقيت مصر)
+    - cron: '0 0 * * *'
+  workflow_dispatch:  # عشان تقدر تشغله يدوي في أي وقت
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install Subfinder and Nuclei
+        run: |
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      - name: Enumerate Subdomains
+        run: |
+          echo "=== Target domains ==="
+          cat targets.txt
+          subfinder -dL targets.txt -silent -all -o subdomains.txt
+          cat targets.txt >> subdomains.txt
+          sort -u subdomains.txt -o subdomains.txt
+          echo "=== Total subdomains found: $(wc -l < subdomains.txt) ==="
+
+      - name: Update Nuclei Templates
+        run: nuclei -update-templates
+
+      - name: Run Nuclei Scan
+        run: |
+          nuclei -l subdomains.txt \
+                 -severity critical,high,medium \
+                 -t cves/ \
+                 -t exposures/ \
+                 -t misconfiguration/ \
+                 -o nuclei_report.txt \
+                 -stats || true
+
+      - name: Upload Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-reports
+          path: |
+            subdomains.txt
+            nuclei_report.txt
+          retention-days: 30
