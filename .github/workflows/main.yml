@@ -1,4 +1,4 @@
-name: Daily Bug Hunter Scan
+name: SEEK Bug Hunter - Optimized
 
 on:
   schedule:
@@ -6,36 +6,22 @@ on:
   workflow_dispatch:
 
 jobs:
-  scan:
+  # ========== المرحلة 1: جمع وتصفية النطاقات ==========
+  recon:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
-
+    timeout-minutes: 40
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
 
       - name: Install Tools
         run: |
-          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           echo "$HOME/go/bin" >> $GITHUB_PATH
-
-      - name: Update Nuclei Templates
-        run: nuclei -update-templates
-
-      - name: Verify Templates Path
-        run: |
-          echo "[*] Templates directory:"
-          ls $HOME/nuclei-templates/
-          echo ""
-          echo "[*] http templates:"
-          ls $HOME/nuclei-templates/http/ | head -20
 
       - name: Enumerate Subdomains
         run: |
@@ -44,44 +30,100 @@ jobs:
           sort -u raw_subs.txt -o raw_subs.txt
           echo "[*] Raw subdomains: $(wc -l < raw_subs.txt)"
 
-      - name: Filter Live Hosts with httpx
+      - name: Filter Live Hosts (strict)
         run: |
           httpx -l raw_subs.txt \
                 -silent \
-                -mc 200,201,202,301,302,401,403,500 \
-                -threads 150 \
-                -timeout 10 \
-                -o subdomains.txt
+                -mc 200,201,401,403 \
+                -threads 200 \
+                -timeout 8 \
+                -retries 1 \
+                -o live_subs.txt
+          echo "[*] Live hosts: $(wc -l < live_subs.txt)"
 
-          echo "[*] Live subdomains: $(wc -l < subdomains.txt)"
-
-      - name: Run Nuclei Scan
+      - name: Split into 10 chunks
         run: |
-          echo "[*] Starting Nuclei with $(wc -l < subdomains.txt) targets"
+          total=$(wc -l < live_subs.txt)
+          echo "[*] Splitting $total hosts into 10 chunks"
+          split -n l/10 -d live_subs.txt chunk_
+          ls -la chunk_*
+          echo "[*] Chunk sizes:"
+          wc -l chunk_*
 
-          nuclei -l subdomains.txt \
+      - name: Upload Chunks
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunks
+          path: chunk_*
+          retention-days: 1
+
+  # ========== المرحلة 2: الفحص بـ 10 Jobs موازية ==========
+  scan:
+    needs: recon
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Install Nuclei
+        run: |
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      - name: Update Templates
+        run: nuclei -update-templates -silent
+
+      - name: Download Chunks
+        uses: actions/download-artifact@v4
+        with:
+          name: chunks
+
+      - name: Run Nuclei on Chunk ${{ matrix.chunk }}
+        run: |
+          f="chunk_0${{ matrix.chunk }}"
+          if [ ! -f "$f" ]; then
+            echo "[!] $f not found - skipping"
+            exit 0
+          fi
+
+          echo "[*] Processing $f"
+          echo "[*] Targets in chunk: $(wc -l < $f)"
+          echo "--- Sample ---"
+          head -5 $f
+
+          nuclei -l "$f" \
                  -severity critical,high,medium \
                  -t "$HOME/nuclei-templates/http/cves/" \
                  -t "$HOME/nuclei-templates/http/exposures/" \
                  -t "$HOME/nuclei-templates/http/misconfiguration/" \
                  -t "$HOME/nuclei-templates/http/takeovers/" \
-                 -rl 100 \
-                 -c 25 \
-                 -timeout 10 \
-                 -retries 2 \
-                 -o nuclei_report.txt \
-                 -stats 2>&1 | tee nuclei_scan.log || true
+                 -t "$HOME/nuclei-templates/http/vulnerabilities/" \
+                 -rl 150 \
+                 -c 30 \
+                 -timeout 8 \
+                 -retries 1 \
+                 -stats \
+                 -o "report_chunk_${{ matrix.chunk }}.txt" \
+                 2>&1 | tee "log_chunk_${{ matrix.chunk }}.log" || true
 
-          echo "[*] Report lines: $(wc -l < nuclei_report.txt 2>/dev/null || echo 0)"
+          echo "[*] Chunk ${{ matrix.chunk }} findings: $(wc -l < report_chunk_${{ matrix.chunk }}.txt 2>/dev/null || echo 0)"
 
-      - name: Upload Reports
+      - name: Upload Chunk Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scan-reports
+          name: report-chunk-${{ matrix.chunk }}
           path: |
-            raw_subs.txt
-            subdomains.txt
-            nuclei_report.txt
-            nuclei_scan.log
+            report_chunk_${{ matrix.chunk }}.txt
+            log_chunk_${{ matrix.chunk }}.log
           retention-days: 30
