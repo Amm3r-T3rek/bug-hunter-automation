@@ -1,4 +1,4 @@
-name: SEEK Bug Hunter - Optimized
+name: seek.com Automated Subdomain & Nuclei Scan
 
 on:
   schedule:
@@ -6,124 +6,74 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ========== المرحلة 1: جمع وتصفية النطاقات ==========
-  recon:
+  security_scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Set up Go Environment
+        uses: actions/setup-go@v5
         with:
           go-version: '1.21'
 
-      - name: Install Tools
+      - name: Run Recon and Nuclei Scan Script
         run: |
-          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-          echo "$HOME/go/bin" >> $GITHUB_PATH
+          python -c '
+          import subprocess, sys, shutil, os
 
-      - name: Enumerate Subdomains
-        run: |
-          subfinder -dL targets.txt -silent -all -o raw_subs.txt
-          cat targets.txt >> raw_subs.txt
-          sort -u raw_subs.txt -o raw_subs.txt
-          echo "[*] Raw subdomains: $(wc -l < raw_subs.txt)"
+          def run_cmd(command):
+              print(f"[*] Running command: {command}")
+              process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
+              return process.returncode, process.stdout, process.stderr
 
-      - name: Filter Live Hosts (strict)
-        run: |
-          httpx -l raw_subs.txt \
-                -silent \
-                -mc 200,201,401,403 \
-                -threads 200 \
-                -timeout 8 \
-                -retries 1 \
-                -o live_subs.txt
-          echo "[*] Live hosts: $(wc -l < live_subs.txt)"
+          def is_installed(name):
+              return shutil.which(name) is not None
 
-      - name: Split into 10 chunks
-        run: |
-          total=$(wc -l < live_subs.txt)
-          echo "[*] Splitting $total hosts into 10 chunks"
-          split -n l/10 -d live_subs.txt chunk_
-          ls -la chunk_*
-          echo "[*] Chunk sizes:"
-          wc -l chunk_*
+          go_bin = os.path.expanduser("~/go/bin")
+          if go_bin not in os.environ["PATH"]:
+              os.environ["PATH"] += os.pathsep + go_bin
 
-      - name: Upload Chunks
+          if not is_installed("nuclei"):
+              run_cmd("go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest")
+          
+          run_cmd("nuclei -update-templates")
+
+          if not is_installed("subfinder"):
+              run_cmd("go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest")
+
+          output_dir = "scan_results"
+          os.makedirs(output_dir, exist_ok=True)
+
+          # تم التعديل هنا ليعمل على example
+          target_domain = "seek.com"
+          subdomains_file = os.path.join(output_dir, f"{target_domain}_subdomains.txt")
+          output_report = os.path.join(output_dir, f"{target_domain}_nuclei_report.txt")
+
+          print(f"--- Step 2: Enumerating subdomains for target: {target_domain} ---")
+          run_cmd(f"subfinder -d {target_domain} -o {subdomains_file} -silent")
+
+          if not os.path.exists(subdomains_file) or os.path.getsize(subdomains_file) == 0:
+              print("[-] No subdomains found.")
+              sys.exit(1)
+
+          with open(subdomains_file, "r") as f:
+              sub_count = len(f.readlines())
+          print(f"[+] Found {sub_count} subdomains.")
+
+          print(f"--- Step 3: Running Nuclei scan ---")
+          run_cmd(f"nuclei -l {subdomains_file} -o {output_report}")
+          print("[+] Scan completed successfully!")
+          '
+
+      - name: Upload Scan Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: chunks
-          path: chunk_*
-          retention-days: 1
-
-  # ========== المرحلة 2: الفحص بـ 10 Jobs موازية ==========
-  scan:
-    needs: recon
-    runs-on: ubuntu-latest
-    timeout-minutes: 350
-
-    strategy:
-      fail-fast: false
-      matrix:
-        chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
-
-      - name: Install Nuclei
-        run: |
-          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-          echo "$HOME/go/bin" >> $GITHUB_PATH
-
-      - name: Update Templates
-        run: nuclei -update-templates -silent
-
-      - name: Download Chunks
-        uses: actions/download-artifact@v4
-        with:
-          name: chunks
-
-      - name: Run Nuclei on Chunk ${{ matrix.chunk }}
-        run: |
-          f="chunk_0${{ matrix.chunk }}"
-          if [ ! -f "$f" ]; then
-            echo "[!] $f not found - skipping"
-            exit 0
-          fi
-
-          echo "[*] Processing $f"
-          echo "[*] Targets in chunk: $(wc -l < $f)"
-          echo "--- Sample ---"
-          head -5 $f
-
-          nuclei -l "$f" \
-                 -severity critical,high,medium \
-                 -t "$HOME/nuclei-templates/http/cves/" \
-                 -t "$HOME/nuclei-templates/http/exposures/" \
-                 -t "$HOME/nuclei-templates/http/misconfiguration/" \
-                 -t "$HOME/nuclei-templates/http/takeovers/" \
-                 -t "$HOME/nuclei-templates/http/vulnerabilities/" \
-                 -rl 150 \
-                 -c 30 \
-                 -timeout 8 \
-                 -retries 1 \
-                 -stats \
-                 -o "report_chunk_${{ matrix.chunk }}.txt" \
-                 2>&1 | tee "log_chunk_${{ matrix.chunk }}.log" || true
-
-          echo "[*] Chunk ${{ matrix.chunk }} findings: $(wc -l < report_chunk_${{ matrix.chunk }}.txt 2>/dev/null || echo 0)"
-
-      - name: Upload Chunk Report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: report-chunk-${{ matrix.chunk }}
-          path: |
-            report_chunk_${{ matrix.chunk }}.txt
-            log_chunk_${{ matrix.chunk }}.log
-          retention-days: 30
+          name: rateitall-scan-reports
+          path: scan_results/
